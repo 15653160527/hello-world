@@ -1,0 +1,183 @@
+两个函数一起测试，利用最新的20条聊天记录
+
+    parent_path = Path(__file__).parent.parent.absolute().as_posix()
+    sys.path.append(parent_path)
+
+    # 测试json
+    file_path = parent_path + '/example_long_chat.json'
+    random_messages = random_read_json(file_path)
+    print(random_messages)
+    # 提取订单状态
+    stream = False
+    user_id = "1"
+    
+    response = ai_order_status(user_id, random_messages, stream)
+    print(f"模型响应为：{response}")
+
+    # 解析数据
+    if isinstance(response, AIOrderStatusResponse):
+        response_dict_str = response.json()
+        response_dict = json.loads(response_dict_str)
+    else:
+        response_dict = response
+    res_order_status = response_dict.get('order_status')
+    res_topic_keyword = response_dict.get('topic_keyword')
+    routineResponse = ai_order_routine(user_id=user_id, order_status=res_order_status,topic_keyword=res_topic_keyword, fuzzy_query=False, stream=False)
+
+    print(f"routineResponse:{routineResponse}")
+
+
+修改内容：
+
+1、config.yaml
+
+  "ai_order_status": "
+    请你根据客服与客户的聊天记录和已定义的订单状态列表，回答当前订单处于哪一个阶段和最合适的最新的一个话题关键词。
+    回答时以较靠前聊天记录为背景参考，判断订单状态和话题关键词主要考虑最近的几条聊天记录。
+    回答以JSON形式返回，形式如下 {{\"order_status\": \"订单状态\", \"topic_keyword\": \"话题关键词\"}}。
+    如果选择的话题关键字不属于其对应的订单状态，则选择的订单状态不变，从相应的订单状态中选择最合适聊天记录的一个话题关键词。结合最新的聊天记录选择一个最合适的话题关键词。
+    已定义的订单状态在如下list中：{order_status_list}，答案只允许从这里面选择一个订单阶段和一个与其内容对应的话题关键字，不能选择其他订单阶段里的话题关键词。
+    不能出现订单状态和话题关键词一样的的情况，也不能出现话题关键词不在选择的订单状态里面的情况。
+    客服与客户的聊天记录在如下list中：{message}，每句话的开头代表了说这句话的角色。
+  ",
+
+2、read_es.py中
+
+
+def read_routines_by_status_topic(order_status, topic_keyword,fuzzy_query=False):
+    if order_status is None:
+        return []
+    if topic_keyword:
+        results = es.search(
+            index="routine_new",
+            body={
+                "query": {
+                    "bool": {
+                        "must": [
+                            {"match": {"order_status": order_status}},
+                            {"match": {"keywords": topic_keyword}}
+                        ]
+                    }
+                },
+                "from": 0,
+                "size": 100,
+                "min_score": 0.1
+            },
+        )
+    else:
+        results = es.search(
+            index="routine_new",
+            body={
+                "query": {
+                    "match": {
+                        "order_status": order_status,
+                    }
+                },
+                "from": 0,
+                "size": 100,
+                "min_score": 0.1
+            },
+        )
+    if not fuzzy_query:
+        filtered_hits = [
+            hit for hit in results["hits"]["hits"] if
+            "keywords" in hit["_source"] and
+            topic_keyword in hit["_source"]["keywords"].split(",")
+        ]
+        return filtered_hits
+
+    else:
+        return results["hits"]["hits"]
+
+
+def read_order_status():
+    """
+    提取es数据库里的order_status和keywords字段全部内容
+    返回:
+    Dict[str, List[str]]: 包含order_status和keywords的字典
+    """
+    results = es.search(
+        index="routine_new",
+        body={
+            "query": {
+                "match_all": {}
+            },
+            "from": 0,
+            "size": 1000,
+            "min_score": 0.1
+        })
+
+    order_status_keywords = {}
+    # 遍历搜索结果中的每个文档
+    for hit in results["hits"]["hits"]:
+        # 获取order_status和keywords
+        order_status = hit["_source"].get("order_status")
+        # 处理没有keywords的情况
+        keywords = hit["_source"].get("keywords", "").split(",")
+        # 如果order_status不在字典中，则添加
+        if order_status not in order_status_keywords:
+            order_status_keywords[order_status] = []
+
+        # 将keywords添加到对应的列表中
+        if keywords in order_status_keywords[order_status]:
+            continue
+        else:
+            order_status_keywords[order_status].extend(keywords)
+	    # 去重
+            order_status_keywords[order_status] = list(set(order_status_keywords[order_status]))
+
+    return order_status_keywords
+
+
+3、修改ai_order_routine.py
+def ai_order_routine(
+        user_id: str = Body(title="用户ID", examples=["wmvJdRCgAA-W8I82BMNIaLqTkm92XNjA"]),
+        order_status: str = Body(title="订单所处阶段", examples=["待服务"]),
+        topic_keyword: str = Body(default='', title="话题关键字", examples=['购车流程介绍']),
+        fuzzy_query: bool = Body(default=False, title="是否模糊查询聊天话术"),
+        stream: bool = Body(default=False, title="是否流式输出")
+) -> Union[AIOrderRoutineResponse, EventSourceResponse]:
+    """
+    根据订单状态，推荐相关话术
+    Args:
+        user_id (str): 用户的唯一标识符
+        order_status (str): 订单状态
+        topic_keyword (str): 话题关键字(子阶段)
+        fuzzy_query (bool): 是否模糊查询聊天话术,默认为False
+        stream (bool, optional): 是否流式响应, 默认为False
+        
+    Returns:
+        
+        - 当stream为True时，返回SSE，每次返回一个JSON
+        - 当stream为False时，返回JSON
+    """
+    logger.info(f"生成订单{user_id}{order_status}中{topic_keyword}话题的推荐话术")
+    # 处理stream
+    if not isinstance(stream, bool):
+        stream = False
+
+    ORDER_STATUS_LIST=read_order_status()
+    topics = ORDER_STATUS_LIST[order_status]
+
+    # 检查话题关键字是否在列表中
+    if any(topic_keyword in subtopics for subtopics in topics):
+        routine_resp = read_routines_by_status_topic(order_status, topic_keyword,fuzzy_query)
+    else:
+        routine_resp = read_routines_by_status_topic(order_status, '',fuzzy_query)
+
+    # 乱序返回3个
+    results = random.sample(routine_resp, k=3) if len(routine_resp) > 3 else routine_resp
+    results = [r["_source"]["routine"] for r in results]
+
+    # 返回结果
+    if stream:
+        return EventSourceResponse(order_routine_generator(results))
+    else:
+        return AIOrderRoutineResponse(
+            routines=results
+        )
+
+
+
+
+
